@@ -19,29 +19,6 @@ init_db()
 
 API_KEY = os.getenv("PSEUDOGRAM_API_KEY")
 
-
-# def verify_webhook_signature(raw_body, signature):
-    if not API_KEY:
-        return False
-
-    if not signature:
-        return False
-
-    if not signature.startswith("sha256="):
-        return False
-
-    received_signature = signature[7:]
-
-    expected_signature = hmac.new(
-        API_KEY.encode("utf-8"),
-        raw_body,
-        hashlib.sha256
-    ).hexdigest()
-
-    return hmac.compare_digest(
-        received_signature,
-        expected_signature
-    )
 def verify_webhook_signature(raw_body, signature):
     if not API_KEY:
         print("HMAC DEBUG: API_KEY is missing")
