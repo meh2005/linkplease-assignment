@@ -1,6 +1,5 @@
 import json
 import time
-import threading
 import sqlite3
 
 from database import get_db
@@ -12,17 +11,21 @@ MAX_RETRIES = 5
 RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 60
 
+DELIVERY_CHECK_INTERVAL = 2
+MAX_DELIVERY_CHECKS = 10
+
 
 def process_event(event):
 
+    event_id = event["event_id"]
     event_type = event["event_type"]
 
     if event_type != "comment.created":
-        mark_event_processed(event["event_id"])
+        mark_event_processed(event_id)
         return
 
-    data = event["payload"]
-    comment = data.get("data", {})
+    payload = event["payload"]
+    comment = payload.get("data", {})
 
     comment_text = comment.get("text", "")
     comment_id = comment.get("comment_id")
@@ -31,7 +34,7 @@ def process_event(event):
     user_id = user_data.get("user_id")
 
     if not comment_text or not comment_id or not user_id:
-        mark_event_processed(event["event_id"])
+        mark_event_processed(event_id)
         return
 
     comment_text_lower = comment_text.lower()
@@ -43,12 +46,16 @@ def process_event(event):
             FROM rules
         """).fetchall()
 
-        for rule in rules:
+    for rule in rules:
 
-            if rule["keyword"].lower() not in comment_text_lower:
-                continue
+        keyword = rule["keyword"].lower()
 
-            try:
+        if keyword not in comment_text_lower:
+            continue
+
+        try:
+
+            with get_db() as db:
 
                 db.execute("""
                     INSERT INTO dm_jobs (
@@ -66,13 +73,15 @@ def process_event(event):
                     rule["dm_message"]
                 ))
 
-                print(
-                    f"DM job created: "
-                    f"user={user_id}, "
-                    f"rule={rule['id']}"
-                )
+            print(
+                f"DM job created: "
+                f"user={user_id}, "
+                f"rule={rule['id']}"
+            )
 
-            except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError:
+
+            with get_db() as db:
 
                 db.execute("""
                     UPDATE stats
@@ -81,13 +90,13 @@ def process_event(event):
                     WHERE id = 1
                 """)
 
-                print(
-                    f"Duplicate blocked: "
-                    f"user={user_id}, "
-                    f"rule={rule['id']}"
-                )
+            print(
+                f"Duplicate blocked: "
+                f"user={user_id}, "
+                f"rule={rule['id']}"
+            )
 
-    mark_event_processed(event["event_id"])
+    mark_event_processed(event_id)
 
 
 def mark_event_processed(event_id):
@@ -106,23 +115,23 @@ def get_pending_events():
     with get_db() as db:
 
         rows = db.execute("""
-            SELECT event_id, event_type, payload
+            SELECT
+                event_id,
+                event_type,
+                payload
             FROM events
             WHERE processed = 0
-            ORDER BY received_at
+            ORDER BY received_at ASC
         """).fetchall()
 
-    events = []
-
-    for row in rows:
-
-        events.append({
+    return [
+        {
             "event_id": row["event_id"],
             "event_type": row["event_type"],
             "payload": json.loads(row["payload"])
-        })
-
-    return events
+        }
+        for row in rows
+    ]
 
 
 def send_pending_jobs():
@@ -133,15 +142,26 @@ def send_pending_jobs():
             SELECT *
             FROM dm_jobs
             WHERE status = 'queued'
-            AND (
-                next_attempt_at IS NULL
-                OR next_attempt_at <= datetime('now')
-            )
-            ORDER BY created_at
+              AND (
+                  next_attempt_at IS NULL
+                  OR next_attempt_at <= datetime('now')
+              )
+            ORDER BY created_at ASC
         """).fetchall()
 
     for job in jobs:
-        send_job(job)
+
+        try:
+            send_job(job)
+
+        except Exception as error:
+
+            print(
+                f"Unexpected error sending "
+                f"job {job['id']}: {error}"
+            )
+
+            schedule_retry(job["id"])
 
 
 def wait_for_rate_limit():
@@ -159,9 +179,7 @@ def wait_for_rate_limit():
                 )
             """).fetchone()
 
-            request_count = row["request_count"]
-
-            if request_count < RATE_LIMIT:
+            if row["request_count"] < RATE_LIMIT:
                 return
 
             oldest = db.execute("""
@@ -178,37 +196,41 @@ def wait_for_rate_limit():
         if not oldest:
             return
 
-        # SQLite timestamps have second precision.
-        # Add a small safety margin.
         try:
 
             with get_db() as db:
 
                 now = db.execute("""
-                    SELECT strftime(
-                        '%s',
-                        'now'
+                    SELECT CAST(
+                        strftime('%s', 'now')
+                        AS INTEGER
                     )
                 """).fetchone()[0]
 
                 oldest_timestamp = db.execute("""
-                    SELECT strftime(
-                        '%s',
-                        ?
+                    SELECT CAST(
+                        strftime('%s', ?)
+                        AS INTEGER
                     )
-                """, (oldest["requested_at"],)).fetchone()[0]
+                """, (
+                    oldest["requested_at"],
+                )).fetchone()[0]
 
             wait_seconds = (
-                int(oldest_timestamp)
+                oldest_timestamp
                 + RATE_WINDOW_SECONDS
-                - int(now)
+                - now
                 + 1
             )
 
         except Exception:
+
             wait_seconds = 2
 
-        wait_seconds = max(wait_seconds, 1)
+        wait_seconds = max(
+            wait_seconds,
+            1
+        )
 
         print(
             f"DM rate limit reached. "
@@ -230,32 +252,41 @@ def record_dm_request(job_id):
         """, (job_id,))
 
 
-def send_job(job):
+def claim_job(job_id):
 
-    job_id = job["id"]
-
-    # Claim job.
     with get_db() as db:
 
         result = db.execute("""
             UPDATE dm_jobs
             SET status = 'sending'
             WHERE id = ?
-            AND status = 'queued'
+              AND status = 'queued'
         """, (job_id,))
 
-        if result.rowcount == 0:
-            return
+        return result.rowcount == 1
 
-    # Wait until our rolling window allows another request.
+
+def send_job(job):
+
+    job_id = job["id"]
+
+    if not claim_job(job_id):
+        return
+
     wait_for_rate_limit()
 
-    # Record the request BEFORE sending it.
-    # The API rate limit counts the request even if
-    # the response is 500 or 429.
+    # Every actual outgoing request is counted
+    # before it is made.
     record_dm_request(job_id)
 
-    idempotency_key = f"dm-job-{job_id}"
+    # Stable idempotency key for this request attempt.
+    # A confirmed delivery failure gets a new key
+    # through schedule_retry().
+    attempt_number = job["attempts"] + 1
+
+    idempotency_key = (
+        f"dm-job-{job_id}-attempt-{attempt_number}"
+    )
 
     try:
 
@@ -269,18 +300,24 @@ def send_job(job):
     except Exception as error:
 
         print(
-            f"Network error for job {job_id}: {error}"
+            f"Network error for job "
+            f"{job_id}: {error}"
         )
 
-        schedule_retry(job_id)
+        # Network failure has uncertain outcome.
+        # Keep retry safe by recording the retry.
+        schedule_retry(
+            job_id,
+            delay=5
+        )
+
         return
 
     print(
-        f"DM API response for job {job_id}: "
-        f"{response.status_code}"
+        f"DM API response for job "
+        f"{job_id}: {response.status_code}"
     )
 
-    # Rate limited
     if response.status_code == 429:
 
         retry_after = response.headers.get(
@@ -290,35 +327,37 @@ def send_job(job):
 
         try:
             retry_after = int(retry_after)
-        except ValueError:
+
+        except (TypeError, ValueError):
             retry_after = 5
 
         schedule_retry(
             job_id,
-            delay=retry_after
+            delay=max(retry_after, 1)
         )
 
         return
 
-    # Temporary server error
     if response.status_code >= 500:
 
-        schedule_retry(job_id)
+        schedule_retry(
+            job_id,
+            delay=5
+        )
+
         return
 
-    # Invalid request
     if response.status_code == 400:
 
         mark_failed(job_id)
 
         print(
-            f"Permanent failure for job {job_id}: "
-            f"invalid request"
+            f"Permanent failure for job "
+            f"{job_id}: invalid request"
         )
 
         return
 
-    # Successful acceptance
     if response.status_code in (200, 202):
 
         try:
@@ -328,7 +367,11 @@ def send_job(job):
 
         except Exception:
 
-            schedule_retry(job_id)
+            schedule_retry(
+                job_id,
+                delay=5
+            )
+
             return
 
         with get_db() as db:
@@ -352,34 +395,39 @@ def send_job(job):
             f"dm_id={dm_id}"
         )
 
-        threading.Thread(
-            target=check_delivery,
-            args=(job_id, dm_id),
-            daemon=True
-        ).start()
-
         return
 
-    schedule_retry(job_id)
+    schedule_retry(
+        job_id,
+        delay=5
+    )
 
 
-def check_delivery(job_id, dm_id):
+def check_waiting_jobs():
 
-    max_checks = 10
+    with get_db() as db:
 
-    for _ in range(max_checks):
+        jobs = db.execute("""
+            SELECT *
+            FROM dm_jobs
+            WHERE status = 'waiting'
+              AND dm_id IS NOT NULL
+        """).fetchall()
 
-        time.sleep(2)
+    for job in jobs:
 
         try:
 
-            response = get_dm_status(dm_id)
+            response = get_dm_status(
+                job["dm_id"]
+            )
 
         except Exception as error:
 
             print(
                 f"Delivery check error "
-                f"for {dm_id}: {error}"
+                f"for dm {job['dm_id']}: "
+                f"{error}"
             )
 
             continue
@@ -397,31 +445,22 @@ def check_delivery(job_id, dm_id):
 
         print(
             f"Delivery status: "
-            f"dm={dm_id}, "
+            f"dm={job['dm_id']}, "
             f"status={status}"
         )
 
         if status == "delivered":
 
             mark_delivered(
-                job_id,
-                dm_id
+                job["id"],
+                job["dm_id"]
             )
 
-            return
+        elif status == "failed":
 
-        if status == "failed":
-
-            handle_delivery_failure(job_id)
-
-            return
-
-        if status == "queued":
-            continue
-
-    # If it never reaches a terminal state,
-    # retry the operation.
-    schedule_retry(job_id)
+            handle_delivery_failure(
+                job["id"]
+            )
 
 
 def handle_delivery_failure(job_id):
@@ -446,12 +485,20 @@ def handle_delivery_failure(job_id):
             f"job={job_id}"
         )
 
-    else:
+        return
 
-        schedule_retry(job_id)
+    # Confirmed failure.
+    # The next send gets a new idempotency key.
+    schedule_retry(
+        job_id,
+        delay=5
+    )
 
 
-def schedule_retry(job_id, delay=5):
+def schedule_retry(
+    job_id,
+    delay=5
+):
 
     with get_db() as db:
 
@@ -495,7 +542,8 @@ def schedule_retry(job_id, delay=5):
                 next_attempt_at = datetime(
                     'now',
                     ? || ' seconds'
-                )
+                ),
+                dm_id = NULL
             WHERE id = ?
         """, (
             attempts,
@@ -511,7 +559,10 @@ def schedule_retry(job_id, delay=5):
     )
 
 
-def mark_delivered(job_id, dm_id):
+def mark_delivered(
+    job_id,
+    dm_id
+):
 
     with get_db() as db:
 
@@ -559,6 +610,7 @@ def worker_loop():
             for event in events:
 
                 try:
+
                     process_event(event)
 
                 except Exception as error:
@@ -570,6 +622,8 @@ def worker_loop():
                     )
 
             send_pending_jobs()
+
+            check_waiting_jobs()
 
         except Exception as error:
 

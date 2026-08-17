@@ -13,30 +13,24 @@ from worker import worker_loop
 
 load_dotenv()
 
+
 app = Flask(__name__)
 
 init_db()
 
+
 API_KEY = os.getenv("PSEUDOGRAM_API_KEY")
 
+
 def verify_webhook_signature(raw_body, signature):
+
     if not API_KEY:
-        print("HMAC DEBUG: API_KEY is missing")
         return False
 
     if not signature:
-        print("HMAC DEBUG: signature header is missing")
         return False
 
-    print(
-        "HMAC DEBUG:",
-        "signature_prefix=", signature[:15],
-        "signature_length=", len(signature),
-        "body_length=", len(raw_body)
-    )
-
     if not signature.startswith("sha256="):
-        print("HMAC DEBUG: invalid signature prefix")
         return False
 
     received_signature = signature[7:]
@@ -47,25 +41,16 @@ def verify_webhook_signature(raw_body, signature):
         hashlib.sha256
     ).hexdigest()
 
-    print(
-        "HMAC DEBUG:",
-        "received_length=", len(received_signature),
-        "expected_length=", len(expected_signature),
-        "match=", hmac.compare_digest(
-            received_signature,
-            expected_signature
-        )
-    )
-
     return hmac.compare_digest(
         received_signature,
         expected_signature
     )
 
+
 @app.route("/rules", methods=["POST"])
 def create_rule():
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
 
     if not data:
         return jsonify({
@@ -75,17 +60,17 @@ def create_rule():
     keyword = data.get("keyword")
     dm_message = data.get("dm_message")
 
-    if not keyword or not dm_message:
+    if not isinstance(keyword, str) or not keyword.strip():
         return jsonify({
-            "error": "keyword and dm_message are required"
+            "error": "keyword is required"
+        }), 400
+
+    if not isinstance(dm_message, str) or not dm_message:
+        return jsonify({
+            "error": "dm_message is required"
         }), 400
 
     keyword = keyword.strip().lower()
-
-    if not keyword:
-        return jsonify({
-            "error": "keyword cannot be empty"
-        }), 400
 
     with get_db() as db:
 
@@ -112,8 +97,7 @@ def create_rule():
 @app.route("/webhook", methods=["POST"])
 def webhook():
 
-    # IMPORTANT:
-    # Read the exact raw request body before parsing JSON.
+    # Read the exact bytes before parsing JSON.
     raw_body = request.get_data(cache=True)
 
     signature = request.headers.get(
@@ -130,8 +114,8 @@ def webhook():
 
     try:
         data = json.loads(raw_body)
-    except json.JSONDecodeError:
 
+    except json.JSONDecodeError:
         return jsonify({
             "error": "Invalid JSON"
         }), 400
@@ -147,7 +131,7 @@ def webhook():
     with get_db() as db:
 
         existing = db.execute("""
-            SELECT event_id
+            SELECT 1
             FROM events
             WHERE event_id = ?
         """, (event_id,)).fetchone()
@@ -229,12 +213,18 @@ def start_worker():
 
     thread = threading.Thread(
         target=worker_loop,
-        daemon=True
+        daemon=True,
+        name="linkplease-worker"
     )
 
     thread.start()
 
+
+# One Gunicorn worker is used in Render.
+# Start exactly one background worker.
 start_worker()
+
+
 if __name__ == "__main__":
 
     app.run(

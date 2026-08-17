@@ -1,28 +1,42 @@
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 
-DATABASE = "linkplease.db"
+
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE = BASE_DIR / "linkplease.db"
 
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DATABASE, timeout=30)
+    conn = sqlite3.connect(
+        DATABASE,
+        timeout=30,
+        check_same_thread=False
+    )
+
     conn.row_factory = sqlite3.Row
 
     try:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+
         yield conn
         conn.commit()
+
     except Exception:
         conn.rollback()
         raise
+
     finally:
         conn.close()
 
 
 def init_db():
+
     with get_db() as db:
 
-        # Rules
         db.execute("""
             CREATE TABLE IF NOT EXISTS rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,7 +46,6 @@ def init_db():
             )
         """)
 
-        # Webhook events
         db.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 event_id TEXT PRIMARY KEY,
@@ -43,7 +56,6 @@ def init_db():
             )
         """)
 
-        # DM jobs
         db.execute("""
             CREATE TABLE IF NOT EXISTS dm_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,13 +69,13 @@ def init_db():
                 next_attempt_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-                FOREIGN KEY (rule_id) REFERENCES rules(id),
+                FOREIGN KEY (rule_id)
+                    REFERENCES rules(id),
 
                 UNIQUE(rule_id, user_id)
             )
         """)
 
-        # Delivery records
         db.execute("""
             CREATE TABLE IF NOT EXISTS sent_dms (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,13 +87,13 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-                FOREIGN KEY (rule_id) REFERENCES rules(id),
+                FOREIGN KEY (rule_id)
+                    REFERENCES rules(id),
 
                 UNIQUE(rule_id, user_id)
             )
         """)
 
-        # Statistics
         db.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -97,9 +109,6 @@ def init_db():
             VALUES (1, 0)
         """)
 
-        # Every outgoing DM API request is recorded here.
-        # This allows us to enforce the rolling 60-second limit
-        # even after an application restart.
         db.execute("""
             CREATE TABLE IF NOT EXISTS dm_send_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +117,6 @@ def init_db():
             )
         """)
 
-        # Indexes
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_events_processed
             ON events(processed)
