@@ -216,10 +216,8 @@ def start_worker():
 
     thread.start()
 
-
+start_worker()
 if __name__ == "__main__":
-
-    start_worker()
 
     app.run(
         host="0.0.0.0",
