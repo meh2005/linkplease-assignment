@@ -20,7 +20,7 @@ init_db()
 API_KEY = os.getenv("PSEUDOGRAM_API_KEY")
 
 
-def verify_webhook_signature(raw_body, signature):
+# def verify_webhook_signature(raw_body, signature):
     if not API_KEY:
         return False
 
@@ -42,7 +42,48 @@ def verify_webhook_signature(raw_body, signature):
         received_signature,
         expected_signature
     )
+def verify_webhook_signature(raw_body, signature):
+    if not API_KEY:
+        print("HMAC DEBUG: API_KEY is missing")
+        return False
 
+    if not signature:
+        print("HMAC DEBUG: signature header is missing")
+        return False
+
+    print(
+        "HMAC DEBUG:",
+        "signature_prefix=", signature[:15],
+        "signature_length=", len(signature),
+        "body_length=", len(raw_body)
+    )
+
+    if not signature.startswith("sha256="):
+        print("HMAC DEBUG: invalid signature prefix")
+        return False
+
+    received_signature = signature[7:]
+
+    expected_signature = hmac.new(
+        API_KEY.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+
+    print(
+        "HMAC DEBUG:",
+        "received_length=", len(received_signature),
+        "expected_length=", len(expected_signature),
+        "match=", hmac.compare_digest(
+            received_signature,
+            expected_signature
+        )
+    )
+
+    return hmac.compare_digest(
+        received_signature,
+        expected_signature
+    )
 
 @app.route("/rules", methods=["POST"])
 def create_rule():
