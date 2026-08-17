@@ -18,14 +18,11 @@ def get_db():
     conn.row_factory = sqlite3.Row
 
     try:
-        # Wait up to 30 seconds if another SQLite transaction
-        # temporarily holds the database lock.
         conn.execute("PRAGMA busy_timeout = 30000")
-
-        # Foreign-key enforcement for this connection.
         conn.execute("PRAGMA foreign_keys = ON")
 
         yield conn
+
         conn.commit()
 
     except Exception:
@@ -36,18 +33,94 @@ def get_db():
         conn.close()
 
 
+def get_stats():
+
+    """
+    Dedicated read-only connection for /stats.
+
+    This connection is intentionally separate from the normal
+    transactional connection used by the worker.
+    """
+
+    conn = sqlite3.connect(
+        DATABASE,
+        timeout=2,
+        check_same_thread=False
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    try:
+        conn.execute("PRAGMA busy_timeout = 2000")
+        conn.execute("PRAGMA query_only = ON")
+
+        result = conn.execute("""
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM dm_jobs
+                    WHERE status = 'delivered'
+                ) AS sent,
+
+                (
+                    SELECT COUNT(*)
+                    FROM dm_jobs
+                    WHERE status = 'failed'
+                ) AS failed,
+
+                (
+                    SELECT COUNT(*)
+                    FROM dm_jobs
+                    WHERE status IN (
+                        'queued',
+                        'sending',
+                        'waiting'
+                    )
+                ) AS queued,
+
+                (
+                    SELECT duplicates_blocked
+                    FROM stats
+                    WHERE id = 1
+                ) AS duplicates_blocked
+        """).fetchone()
+
+        return {
+            "sent": result["sent"],
+            "failed": result["failed"],
+            "queued": result["queued"],
+            "duplicates_blocked": (
+                result["duplicates_blocked"]
+                if result["duplicates_blocked"] is not None
+                else 0
+            )
+        }
+
+    finally:
+        conn.close()
+
+
 def init_db():
 
-    # Configure WAL once, not on every database connection.
+    # Configure WAL once.
     setup_conn = sqlite3.connect(
         DATABASE,
         timeout=30
     )
 
     try:
-        setup_conn.execute("PRAGMA busy_timeout = 30000")
-        setup_conn.execute("PRAGMA journal_mode = WAL")
-        setup_conn.execute("PRAGMA foreign_keys = ON")
+        setup_conn.execute(
+            "PRAGMA busy_timeout = 30000"
+        )
+
+        setup_conn.execute(
+            "PRAGMA journal_mode = WAL"
+        )
+
+        setup_conn.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
         setup_conn.commit()
 
     finally:
@@ -132,8 +205,7 @@ def init_db():
             VALUES (1, 0)
         """)
 
-        # Outgoing DM request log.
-        # Used to enforce the 10 requests / 60 seconds limit.
+        # Outgoing DM request log
         db.execute("""
             CREATE TABLE IF NOT EXISTS dm_send_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

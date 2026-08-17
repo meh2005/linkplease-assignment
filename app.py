@@ -1,3 +1,4 @@
+import sqlite3
 import os
 import json
 import hmac
@@ -7,7 +8,7 @@ import threading
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
-from database import get_db, init_db
+from database import get_db, get_stats, init_db
 from worker import worker_loop
 
 
@@ -97,7 +98,7 @@ def create_rule():
 @app.route("/webhook", methods=["POST"])
 def webhook():
 
-    # Read the exact bytes before parsing JSON.
+    # Read the exact raw bytes before parsing JSON.
     raw_body = request.get_data(cache=True)
 
     signature = request.headers.get(
@@ -116,6 +117,7 @@ def webhook():
         data = json.loads(raw_body)
 
     except json.JSONDecodeError:
+
         return jsonify({
             "error": "Invalid JSON"
         }), 400
@@ -124,6 +126,7 @@ def webhook():
     event_type = data.get("event_type")
 
     if not event_id or not event_type:
+
         return jsonify({
             "error": "event_id and event_type are required"
         }), 400
@@ -171,42 +174,16 @@ def health():
 @app.route("/stats", methods=["GET"])
 def stats():
 
-    with get_db() as db:
+    try:
 
-        sent = db.execute("""
-            SELECT COUNT(*)
-            FROM dm_jobs
-            WHERE status = 'delivered'
-        """).fetchone()[0]
+        statistics = get_stats()
 
-        failed = db.execute("""
-            SELECT COUNT(*)
-            FROM dm_jobs
-            WHERE status = 'failed'
-        """).fetchone()[0]
+        return jsonify(statistics), 200
 
-        queued = db.execute("""
-            SELECT COUNT(*)
-            FROM dm_jobs
-            WHERE status IN (
-                'queued',
-                'sending',
-                'waiting'
-            )
-        """).fetchone()[0]
-
-        duplicates = db.execute("""
-            SELECT duplicates_blocked
-            FROM stats
-            WHERE id = 1
-        """).fetchone()[0]
-
-    return jsonify({
-        "sent": sent,
-        "failed": failed,
-        "queued": queued,
-        "duplicates_blocked": duplicates
-    }), 200
+    except sqlite3.Error:
+        return jsonify({
+            "error": "database_unavailable"
+        }), 503
 
 
 def start_worker():
@@ -220,7 +197,6 @@ def start_worker():
     thread.start()
 
 
-# One Gunicorn worker is used in Render.
 # Start exactly one background worker.
 start_worker()
 
