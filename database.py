@@ -18,8 +18,11 @@ def get_db():
     conn.row_factory = sqlite3.Row
 
     try:
+        # Wait up to 30 seconds if another SQLite transaction
+        # temporarily holds the database lock.
         conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode = WAL")
+
+        # Foreign-key enforcement for this connection.
         conn.execute("PRAGMA foreign_keys = ON")
 
         yield conn
@@ -35,8 +38,24 @@ def get_db():
 
 def init_db():
 
+    # Configure WAL once, not on every database connection.
+    setup_conn = sqlite3.connect(
+        DATABASE,
+        timeout=30
+    )
+
+    try:
+        setup_conn.execute("PRAGMA busy_timeout = 30000")
+        setup_conn.execute("PRAGMA journal_mode = WAL")
+        setup_conn.execute("PRAGMA foreign_keys = ON")
+        setup_conn.commit()
+
+    finally:
+        setup_conn.close()
+
     with get_db() as db:
 
+        # Rules
         db.execute("""
             CREATE TABLE IF NOT EXISTS rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +65,7 @@ def init_db():
             )
         """)
 
+        # Webhook events
         db.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 event_id TEXT PRIMARY KEY,
@@ -56,6 +76,7 @@ def init_db():
             )
         """)
 
+        # DM jobs
         db.execute("""
             CREATE TABLE IF NOT EXISTS dm_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,6 +97,7 @@ def init_db():
             )
         """)
 
+        # Delivery records
         db.execute("""
             CREATE TABLE IF NOT EXISTS sent_dms (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +116,7 @@ def init_db():
             )
         """)
 
+        # Statistics
         db.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -109,6 +132,8 @@ def init_db():
             VALUES (1, 0)
         """)
 
+        # Outgoing DM request log.
+        # Used to enforce the 10 requests / 60 seconds limit.
         db.execute("""
             CREATE TABLE IF NOT EXISTS dm_send_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,6 +142,7 @@ def init_db():
             )
         """)
 
+        # Indexes
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_events_processed
             ON events(processed)
